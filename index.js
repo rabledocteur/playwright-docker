@@ -28,18 +28,18 @@ app.use(express.json({ limit: '5mb' }));
 app.get('/health', (_req, res) => res.status(200).send('ok'));
 
 // ---------- UTILS COOKIES ----------
-const TTK_BASE_URL = 'https://www.tiktok.com';
+const TTK_BASE_URL = 'https://www.tiktok.com/'; // ← retouche 2: slash final
 
 const mapSameSite = (v) => {
-  if (!v && v !== 0) return undefined;
+  if (v === undefined || v === null) return undefined;
   const s = String(v).toLowerCase();
   if (s === 'lax') return 'Lax';
   if (s === 'strict') return 'Strict';
   if (s === 'no_restriction' || s === 'none') return 'None';
-  return undefined; // on laisse Playwright décider
+  return undefined;
 };
 
-// Convertit un export Cookie-Editor → cookies Playwright sûrs (basés sur url)
+// Convertit un export Cookie-Editor → cookies Playwright (basés sur url)
 const toPlaywrightCookiesStrict = (raw = []) => {
   return raw
     .filter((c) => c && typeof c.name === 'string' && c.name.length > 0 && c.value !== undefined)
@@ -47,15 +47,25 @@ const toPlaywrightCookiesStrict = (raw = []) => {
       const out = {
         name: String(c.name),
         value: String(c.value ?? ''),
-        url: TTK_BASE_URL, // <-- clé: pas de domain/path → l’erreur disparaît
+        url: TTK_BASE_URL, // pas de domain/path ⇒ évite l'erreur addCookies
         httpOnly: !!c.httpOnly,
         secure: !!c.secure,
       };
+
+      // SameSite
       const ss = mapSameSite(c.sameSite);
       if (ss) out.sameSite = ss;
 
-      const exp = Number(c.expirationDate);
-      if (Number.isFinite(exp) && exp > 0) out.expires = Math.floor(exp);
+      // ← retouche 1: si SameSite=None, exiger Secure (règle web)
+      if (ss === 'None') out.secure = true;
+
+      // Expiration (Cookie-Editor => 'expirationDate' en secondes)
+      let exp = Number(c.expirationDate ?? c.expiry);
+      if (Number.isFinite(exp) && exp > 0) {
+        // si on reçoit des ms par erreur
+        if (exp > 1e12) exp = Math.floor(exp / 1000);
+        out.expires = Math.floor(exp);
+      }
 
       return out;
     });
@@ -83,12 +93,7 @@ async function upsertSession({ platform, account, cookies, user_agent }) {
   if (!supabase) throw new Error('Supabase not configured');
   if (!Array.isArray(cookies)) throw new Error('cookies must be an array');
 
-  const row = {
-    platform,
-    account,
-    cookies,
-    user_agent: user_agent || null,
-  };
+  const row = { platform, account, cookies, user_agent: user_agent || null };
 
   const { data, error } = await supabase
     .from('tiktok_sessions')
@@ -133,7 +138,7 @@ app.post('/auth/set-cookies', async (req, res) => {
       platform,
       account,
       cookies,
-      user_agent: req.body.user_agent || null,
+      user_agent: req.body.user_agent || req.headers['user-agent'] || null,
     });
 
     return res.json({
@@ -153,13 +158,8 @@ app.post('/auth/set-cookies', async (req, res) => {
 app.post('/run', async (req, res) => {
   const mode = req.body.mode || 'smoke';
 
-  if (mode === 'smoke') {
-    return smokeRun(req, res);
-  }
-
-  if (mode === 'tiktok.check') {
-    return tiktokCheck(req, res);
-  }
+  if (mode === 'smoke') return smokeRun(req, res);
+  if (mode === 'tiktok.check') return tiktokCheck(req, res);
 
   return res.json({ ok: true, mode }); // fallback debug
 });
@@ -201,7 +201,7 @@ async function tiktokCheck(req, res) {
       viewport: { width: 1280, height: 800 },
     });
 
-    // Injection incrémentale → si un cookie est invalide, on sait lequel
+    // Injection incrémentale — utile pour identifier un cookie cassé
     try {
       for (let i = 0; i < cookiesPW.length; i++) {
         const ck = cookiesPW[i];
@@ -225,13 +225,13 @@ async function tiktokCheck(req, res) {
         .first()
         .isVisible()
         .catch(() => false);
+
       const loginBtn = await page
         .locator('[data-e2e="top-login-button"], a[href*="/login"]')
         .first()
         .isVisible()
         .catch(() => false);
 
-      // secours via présence de cookies critiques
       const names = new Set(cookiesRaw.map((c) => c.name));
       const hasSess = names.has('sessionid') || names.has('sessionid_ss') || names.has('sid_tt');
 
