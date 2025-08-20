@@ -1,289 +1,423 @@
-const { chromium, firefox, webkit } = require('playwright');  // Importation de Playwright (peut utiliser chromium, firefox, webkit)
+// index.js (CommonJS)
+require('dotenv').config();
 
-(async () => {
-    // Lecture des arguments de la ligne de commande
-    const mode = process.argv[2];
-    const videoUrl = process.argv[3];
-    const commentIndexArg = process.argv[4];
-    const replyTextArg = process.argv.slice(5).join(" ");  // Tout ce qui suit l'index sera le texte de réponse (permet les espaces)
+const express = require('express');
+const { chromium } = require('playwright');
+const { createClient } = require('@supabase/supabase-js');
 
-    if (!mode) {
-        console.error("❌ Mode non spécifié. Veuillez indiquer 'tiktok.debugSelectors', 'tiktok.fetchComments' ou 'tiktok.reply'.");
-        process.exit(1);
+// ---------- ENV ----------
+const PORT = Number(process.env.PORT || 3000);
+const HEADLESS = String(process.env.HEADLESS || 'true').toLowerCase() === 'true';
+const SMOKE_URL = process.env.SMOKE_URL || 'https://example.com/';
+
+const SUPABASE_URL = process.env.SUPABASE_URL || '';
+const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY || '';
+
+const TTK_PLATFORM = (process.env.TTK_PLATFORM || 'tiktok').toLowerCase();
+const TTK_ACCOUNT = process.env.TTK_ACCOUNT || ''; // ex: rab.le.dr.numerique
+
+const hasSupabase = SUPABASE_URL && SUPABASE_SERVICE_ROLE_KEY;
+const supabase = hasSupabase
+  ? createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, { auth: { persistSession: false } })
+  : null;
+
+// ---------- EXPRESS ----------
+const app = express();
+app.use(express.json({ limit: '5mb' }));
+
+app.get('/health', (_req, res) => res.status(200).send('ok'));
+
+// ---------- UTILS COOKIES ----------
+const TTK_BASE_URL = 'https://www.tiktok.com/'; // slash final
+
+const mapSameSite = (v) => {
+  if (v === undefined || v === null) return undefined;
+  const s = String(v).toLowerCase();
+  if (s === 'lax') return 'Lax';
+  if (s === 'strict') return 'Strict';
+  if (s === 'no_restriction' || s === 'none') return 'None';
+  return undefined;
+};
+
+// Convertit un export Cookie-Editor → cookies Playwright (basés sur url)
+const toPlaywrightCookiesStrict = (raw = []) => {
+  return raw
+    .filter((c) => c && typeof c.name === 'string' && c.name.length > 0 && c.value !== undefined)
+    .map((c) => {
+      const out = {
+        name: String(c.name),
+        value: String(c.value ?? ''),
+        url: TTK_BASE_URL,              // pas de domain/path ⇒ évite l'erreur addCookies
+        httpOnly: !!c.httpOnly,
+        secure: !!c.secure,
+      };
+
+      const ss = mapSameSite(c.sameSite);
+      if (ss) out.sameSite = ss;
+      if (ss === 'None') out.secure = true; // règle web
+
+      let exp = Number(c.expirationDate ?? c.expiry);
+      if (Number.isFinite(exp) && exp > 0) {
+        if (exp > 1e12) exp = Math.floor(exp / 1000); // corrige ms
+        out.expires = Math.floor(exp);
+      }
+      return out;
+    });
+};
+
+// flags debug
+const cookieFlags = (list = []) => {
+  const names = new Set(list.map((c) => c.name));
+  const has = (n) => names.has(n);
+  return {
+    has_sessionid: has('sessionid'),
+    has_sessionid_ss: has('sessionid_ss'),
+    has_sid_tt: has('sid_tt'),
+    has_sid_ucp_v1: has('sid_ucp_v1'),
+    has_ssid_ucp_v1: has('ssid_ucp_v1'),
+    has_msToken: has('msToken'),
+    has_ttwid: has('ttwid'),
+    has_tt_chain_token: has('tt_chain_token'),
+    has_tt_csrf_token: has('tt_csrf_token'),
+  };
+};
+
+// ---------- SUPABASE HELPERS ----------
+async function upsertSession({ platform, account, cookies, user_agent }) {
+  if (!supabase) throw new Error('Supabase not configured');
+  if (!Array.isArray(cookies)) throw new Error('cookies must be an array');
+
+  const row = { platform, account, cookies, user_agent: user_agent || null };
+
+  const { data, error } = await supabase
+    .from('tiktok_sessions')
+    .upsert(row, { onConflict: 'platform,account' })
+    .select()
+    .limit(1);
+
+  if (error) throw error;
+  return data && data[0];
+}
+
+async function loadSession(platform, account) {
+  if (!supabase) throw new Error('Supabase not configured');
+  const { data, error } = await supabase
+    .from('tiktok_sessions')
+    .select('cookies,user_agent')
+    .eq('platform', platform)
+    .eq('account', account)
+    .order('id', { ascending: false })
+    .limit(1);
+
+  if (error) throw error;
+  if (!data || !data.length) return null;
+  return data[0];
+}
+
+// ---------- AUTH: ENREGISTRE LES COOKIES EN DB ----------
+app.post('/auth/set-cookies', async (req, res) => {
+  try {
+    const platform = (req.body.platform || TTK_PLATFORM || 'tiktok').toLowerCase();
+    const account = req.body.account || TTK_ACCOUNT;
+    const cookies = req.body.cookies;
+
+    if (!Array.isArray(cookies)) {
+      return res.status(400).json({ ok: false, error: 'Body must include "cookies": []' });
     }
-    if (!videoUrl) {
-        console.error("❌ URL de la vidéo TikTok manquante. Veuillez fournir l'URL de la vidéo en second argument.");
-        process.exit(1);
+    if (!account) {
+      return res.status(400).json({ ok: false, error: 'Missing "account"' });
     }
 
-    // Validation supplémentaire pour le mode reply
-    let commentIndex = null;
-    let replyText = null;
-    if (mode === 'tiktok.reply') {
-        if (!commentIndexArg) {
-            console.error("❌ En mode reply, veuillez fournir l'index du commentaire en troisième argument et le texte de réponse en quatrième argument.");
-            process.exit(1);
-        }
-        commentIndex = parseInt(commentIndexArg, 10);
-        if (isNaN(commentIndex) || commentIndex < 0) {
-            console.error("❌ Index du commentaire invalide. Assurez-vous de fournir un nombre (>= 0).");
-            process.exit(1);
-        }
-        replyText = replyTextArg;
-        if (!replyText || replyText.trim() === "") {
-            console.error("❌ Texte de réponse manquant ou vide. Fournissez le texte à envoyer en réponse.");
-            process.exit(1);
-        }
-    }
+    const saved = await upsertSession({
+      platform,
+      account,
+      cookies,
+      user_agent: req.body.user_agent || req.headers['user-agent'] || null,
+    });
 
-    // Démarrage du navigateur (ici on utilise Firefox pour l'exemple, mais Chromium ou WebKit fonctionnent aussi)
-    const browser = await firefox.launch({ headless: false });  // headless: false pour voir l'action, peut être mis à true en production
-    const context = await browser.newContext();
-    const page = await context.newPage();
+    return res.json({
+      ok: true,
+      platform,
+      account,
+      saved: cookies.length,
+      flags: cookieFlags(cookies),
+      rowId: saved?.id || null,
+    });
+  } catch (e) {
+    return res.status(500).json({ ok: false, error: e.message || String(e) });
+  }
+});
 
-    // Augmenter le timeout global par précaution (par défaut ~30s)
-    page.setDefaultTimeout(30000);  // 30 secondes par défaut pour les actions/sélecteurs
+// ===================== HELPERS BROWSER =====================
+async function getContextWithSession({ account = TTK_ACCOUNT, platform = TTK_PLATFORM }) {
+  if (!hasSupabase) throw new Error('Supabase not configured');
+  const session = await loadSession(platform, account);
+  if (!session) throw new Error('No session in DB for this account/platform');
 
-    console.log("ℹ️ Ouverture de la page TikTok:", videoUrl);
+  const cookiesRaw = Array.isArray(session.cookies) ? session.cookies : [];
+  const cookiesPW = toPlaywrightCookiesStrict(cookiesRaw);
+
+  const browser = await chromium.launch({ headless: HEADLESS });
+  const context = await browser.newContext({
+    userAgent: session.user_agent || undefined,
+    viewport: { width: 1366, height: 900 },
+  });
+
+  for (let i = 0; i < cookiesPW.length; i++) {
+    const ck = cookiesPW[i];
+    await context.addCookies([ck]).catch((e) => {
+      throw new Error(`cookie[${i}] "${ck.name}": ${e.message}`);
+    });
+  }
+
+  const page = await context.newPage();
+  return { browser, context, page };
+}
+
+// Ouvre l’onglet Commentaires si présent
+async function ensureCommentsOpen(page) {
+  const commentsTab = page.getByRole('tab', { name: /commentaires|comments/i });
+  if (await commentsTab.isVisible().catch(() => false)) {
+    await commentsTab.click();
+    await page.waitForTimeout(700);
+  }
+}
+
+// Ferme un overlay/modal éventuel qui bloque les clics
+async function closeBlockingOverlays(page) {
+  // TUX modal overlay (TikTok)
+  const overlay = page.locator('[data-station-status="open"][data-tux-color-scheme]');
+  if (await overlay.first().isVisible().catch(() => false)) {
+    await page.keyboard.press('Escape').catch(() => {});
+    await overlay.first().waitFor({ state: 'detached', timeout: 2000 }).catch(() => {});
+  }
+}
+
+// Scroll fort pour hydrater la liste de commentaires
+async function hydrateComments(page, loops = 10) {
+  for (let i = 0; i < loops; i++) {
+    await page.mouse.wheel(0, 900);
+    await page.waitForTimeout(400);
+  }
+}
+
+// Sélecteurs robustes (fallback-chain)
+const SEL = {
+  // Item : deux variantes vues sur TikTok web
+  item: 'div[class*="DivCommentObject"], [data-e2e="comment-item"], li[class*="CommentItem"]',
+  // User : lien profil ou data-e2e
+  user: 'a[href^="/@"], [data-e2e="comment-username"]',
+  // Texte : data-e2e, sinon niveaux, sinon texte brut du bloc contenu
+  text: '[data-e2e="comment-text"], span[data-e2e^="comment-level"], div[class*="DivCommentSubContent"]',
+  // Bouton répondre (FR/EN)
+  replyBtn: 'button:has-text("Répondre"), button:has-text("Reply"), [data-e2e="comment-reply"]',
+  // Champ saisie
+  input: '[data-e2e="comment-input"], textarea',
+};
+
+// ===================== RUN MODES ===========================
+app.post('/run', async (req, res) => {
+  const mode = req.body.mode || 'smoke';
+
+  if (mode === 'smoke')                return smokeRun(req, res);
+  if (mode === 'tiktok.check')         return tiktokCheck(req, res);
+  if (mode === 'tiktok.debugSelectors')return tiktokDebugSelectors(req, res);
+  if (mode === 'tiktok.fetchComments') return tiktokFetchComments(req, res);
+  if (mode === 'tiktok.reply')         return tiktokReply(req, res);
+
+  return res.json({ ok: true, mode }); // fallback debug
+});
+
+// --- smoke
+async function smokeRun(_req, res) {
+  const browser = await chromium.launch({ headless: HEADLESS });
+  const context = await browser.newContext({ viewport: { width: 1280, height: 800 } });
+  const page = await context.newPage();
+  await page.goto(SMOKE_URL, { waitUntil: 'domcontentloaded', timeout: 60000 });
+  const title = await page.title();
+  const url = page.url();
+  await browser.close();
+  return res.json({ ok: true, title, url });
+}
+
+// --- check (ouvre tiktok.com avec cookies)
+async function tiktokCheck(req, res) {
+  const account = req.body.account || TTK_ACCOUNT;
+  const platform = (req.body.platform || TTK_PLATFORM || 'tiktok').toLowerCase();
+
+  if (!hasSupabase) return res.json({ ok: false, error: 'Supabase not configured' });
+  if (!account) return res.json({ ok: false, error: 'Missing "account"' });
+
+  try {
+    const session = await loadSession(platform, account);
+    if (!session) return res.json({ ok: false, error: 'No session in DB for this account/platform' });
+
+    const cookiesRaw = Array.isArray(session.cookies) ? session.cookies : [];
+    const cookiesPW = toPlaywrightCookiesStrict(cookiesRaw);
+
+    const browser = await chromium.launch({ headless: HEADLESS });
+    const context = await browser.newContext({
+      userAgent: session.user_agent || undefined,
+      viewport: { width: 1366, height: 900 },
+    });
+
     try {
-        // Navigation vers la page de la vidéo TikTok
-        await page.goto(videoUrl, { waitUntil: 'load', timeout: 60000 });
-    } catch (err) {
-        console.error("❌ Échec du chargement de la page TikTok:", err);
-        await browser.close();
-        process.exit(1);
+      for (let i = 0; i < cookiesPW.length; i++) {
+        await context.addCookies([cookiesPW[i]]);
+      }
+    } catch (e) {
+      await browser.close();
+      return res.json({ ok: false, error: `addCookies: ${e.message}` });
     }
-    console.log("✔️ Page TikTok chargée avec succès.");
 
-    // Définition des ensembles de sélecteurs potentiels pour les éléments de la page
-    const selectors = {
-        commentItem: [
-            'div[class*="DivCommentObject"]',
-            '[data-e2e="comment-item"]',
-            'li[class*="CommentItem"]'
-        ],
-        commentUser: [
-            'a[href^="/@"]',
-            '[data-e2e="comment-username"]'
-        ],
-        commentText: [
-            '[data-e2e^="comment-text"]',
-            'span[data-e2e^="comment-level"]',
-            'div[class*="DivCommentSubContent"]'
-        ],
-        replyButton: [
-            'button:has-text("Répondre")',
-            'button:has-text("Reply")',
-            '[data-e2e="comment-reply"]'
-        ],
-        commentInput: [
-            '[data-e2e="comment-input"]',
-            'textarea'
-        ]
+    const page = await context.newPage();
+    await page.goto(TTK_BASE_URL, { waitUntil: 'domcontentloaded', timeout: 60000 });
+
+    // Détection simple
+    let loggedIn = false;
+    try {
+      const avatar = await page.locator('[data-e2e="nav-user-avatar"]').first().isVisible().catch(() => false);
+      const loginBtn = await page.locator('[data-e2e="top-login-button"], a[href*="/login"]').first().isVisible().catch(() => false);
+      const names = new Set(cookiesRaw.map((c) => c.name));
+      const hasSess = names.has('sessionid') || names.has('sessionid_ss') || names.has('sid_tt');
+      loggedIn = Boolean(avatar || (hasSess && !loginBtn));
+    } catch (_) {}
+
+    const title = await page.title().catch(() => null);
+    const url = page.url();
+    await browser.close();
+    return res.json({
+      ok: true, usedSupabase: true, account, platform, loggedIn, title, url, cookiesCount: cookiesPW.length,
+    });
+  } catch (e) {
+    return res.json({ ok: false, error: e.message || String(e) });
+  }
+}
+
+// --- debug selectors : compte ce que voit Playwright
+async function tiktokDebugSelectors(req, res) {
+  const { videoUrl, account = TTK_ACCOUNT, platform = TTK_PLATFORM } = req.body;
+  if (!videoUrl) return res.json({ ok: false, error: 'Missing "videoUrl"' });
+
+  try {
+    const { browser, page } = await getContextWithSession({ account, platform });
+    await page.goto(videoUrl, { waitUntil: 'domcontentloaded', timeout: 60000 });
+    await ensureCommentsOpen(page);
+    await hydrateComments(page, 12);
+
+    const counts = {
+      item: await page.locator(SEL.item).count().catch(() => 0),
+      user: await page.locator(SEL.user).count().catch(() => 0),
+      text: await page.locator(SEL.text).count().catch(() => 0),
+      reply: await page.locator(SEL.replyBtn).count().catch(() => 0),
     };
 
-    // Fonction utilitaire pour trouver le premier sélecteur valide d'une liste
-    async function findWorkingSelector(selectorOptions) {
-        for (const sel of selectorOptions) {
-            try {
-                // Attendre un court instant pour voir si ce sélecteur existe dans la page
-                await page.waitForSelector(sel, { timeout: 3000, state: 'attached' });
-                const elements = await page.$$(sel);
-                if (elements && elements.length > 0) {
-                    return sel;
-                }
-            } catch (e) {
-                // Ignorer les timeouts pour tester le prochain sélecteur
-            }
+    const sample = [];
+    const n = Math.min(counts.item, 3);
+    for (let i = 0; i < n; i++) {
+      const root = page.locator(SEL.item).nth(i);
+      const u = await root.locator(SEL.user).first().textContent().catch(() => null);
+      const t = await root.locator(SEL.text).first().textContent().catch(() => null);
+      sample.push({ index: i, user: u?.trim() ?? null, text: t?.trim() ?? null });
+    }
+
+    await browser.close();
+    return res.json({ ok: true, url: videoUrl, selectors: { ...SEL }, counts, sample });
+  } catch (e) {
+    return res.json({ ok: false, error: e.message || String(e) });
+  }
+}
+
+// --- fetch comments
+async function tiktokFetchComments(req, res) {
+  const { videoUrl, limit = 5, account = TTK_ACCOUNT, platform = TTK_PLATFORM } = req.body;
+  if (!videoUrl) return res.json({ ok: false, error: 'Missing "videoUrl"' });
+
+  try {
+    const { browser, page } = await getContextWithSession({ account, platform });
+    await page.goto(videoUrl, { waitUntil: 'domcontentloaded', timeout: 60000 });
+    await ensureCommentsOpen(page);
+    await hydrateComments(page, 14);
+
+    // Attends qu’au moins 1 item soit visible (si possible)
+    const anyItem = page.locator(SEL.item).first();
+    await anyItem.waitFor({ state: 'visible', timeout: 5000 }).catch(() => {});
+
+    const comments = await page.evaluate(({ SEL, limit }) => {
+      const pick = (el, selList) => {
+        for (const s of selList.split(',')) {
+          const t = el.querySelector(s.trim());
+          const val = t?.textContent?.trim();
+          if (val) return val;
         }
         return null;
-    }
+      };
 
-    if (mode === 'tiktok.debugSelectors') {
-        console.log("🔍 Mode debugSelectors: identification des sélecteurs de commentaires...");
+      const nodes =
+        Array.from(document.querySelectorAll(SEL.item)) ||
+        [];
 
-        // Identification de chaque type de sélecteur
-        const foundItemSel = await findWorkingSelector(selectors.commentItem);
-        const foundUserSel = await findWorkingSelector(selectors.commentUser);
-        const foundTextSel = await findWorkingSelector(selectors.commentText);
-        const foundReplyBtnSel = await findWorkingSelector(selectors.replyButton);
-        const foundInputSel = await findWorkingSelector(selectors.commentInput);
+      return nodes.slice(0, limit).map((el, i) => {
+        const user = pick(el, SEL.user);
+        const text =
+          pick(el, SEL.text) ||
+          // dernier secours : coupe le texte de l’item
+          (el.textContent || '').trim();
+        return { index: i, user, text };
+      }).filter(x => x.user || x.text);
+    }, { SEL, limit });
 
-        // Afficher les sélecteurs trouvés ou indiquer ceux manquants
-        if (foundItemSel) {
-            console.log("✔️ Sélecteur 'commentItem' trouvé:", foundItemSel);
-            const count = await page.$$eval(foundItemSel, els => els.length);
-            console.log(`   -> Nombre d'éléments commentaire détectés: ${count}`);
-        } else {
-            console.warn("❌ Aucun sélecteur 'commentItem' valide n'a été trouvé.");
-        }
-        if (foundUserSel) {
-            console.log("✔️ Sélecteur 'commentUser' trouvé:", foundUserSel);
-        } else {
-            console.warn("❌ Aucun sélecteur 'commentUser' valide n'a été trouvé.");
-        }
-        if (foundTextSel) {
-            console.log("✔️ Sélecteur 'commentText' trouvé:", foundTextSel);
-        } else {
-            console.warn("❌ Aucun sélecteur 'commentText' valide n'a été trouvé.");
-        }
-        if (foundReplyBtnSel) {
-            console.log("✔️ Sélecteur 'replyButton' trouvé:", foundReplyBtnSel);
-        } else {
-            console.warn("❌ Aucun sélecteur 'replyButton' valide n'a été trouvé.");
-        }
-        if (foundInputSel) {
-            console.log("✔️ Sélecteur 'commentInput' trouvé:", foundInputSel);
-        } else {
-            console.warn("❌ Aucun sélecteur 'commentInput' valide n'a été trouvé.");
-        }
-
-        console.log("🔎 Mode debug terminé. Utilisez ces sélecteurs identifiés dans les autres modes.");
-    } 
-
-    else if (mode === 'tiktok.fetchComments') {
-        console.log("🔍 Mode fetchComments: extraction des commentaires de la vidéo...");
-
-        // Attendre que la liste de commentaires soit rendue (le conteneur principal des commentaires)
-        try {
-            await page.waitForSelector(
-                'div[class*="CommentListContainer"], [data-e2e="comment-list"]',
-                { timeout: 15000, state: 'visible' }
-            );
-        } catch (err) {
-            console.error("❌ Les commentaires ne se sont pas chargés à temps (timeout).");
-            await browser.close();
-            process.exit(1);
-        }
-
-        // Récupérer tous les éléments de commentaire
-        const commentItems = await page.$$('div[class*="DivCommentObject"], [data-e2e="comment-item"], li[class*="CommentItem"]');
-        const totalComments = commentItems.length;
-        if (totalComments === 0) {
-            console.log("ℹ️ Aucun commentaire trouvé sur cette vidéo.");
-        } else {
-            console.log(`✔️ ${totalComments} commentaire(s) trouvé(s).`);
-            for (let i = 0; i < totalComments; i++) {
-                const comment = commentItems[i];
-                // Extraire le nom d'utilisateur du commentaire
-                let username = "Utilisateur inconnu";
-                const userElem = await comment.$('a[href^="/@"], [data-e2e="comment-username"]');
-                if (userElem) {
-                    username = await userElem.innerText().catch(() => "Utilisateur");
-                }
-                // Extraire le texte du commentaire
-                let text = "(commentaire vide)";
-                const textElem = await comment.$('[data-e2e^="comment-text"], span[data-e2e^="comment-level"], div[class*="DivCommentSubContent"]');
-                if (textElem) {
-                    text = await textElem.innerText().catch(() => "(texte illisible)");
-                }
-                console.log(`→ Commentaire #${i} par ${username} : ${text}`);
-            }
-        }
-    } 
-
-    else if (mode === 'tiktok.reply') {
-        console.log(`🔍 Mode reply: préparation de la réponse au commentaire #${commentIndex}...`);
-
-        // Attendre que les commentaires soient visibles
-        try {
-            await page.waitForSelector(
-                'div[class*="CommentListContainer"], [data-e2e="comment-list"]',
-                { timeout: 15000, state: 'visible' }
-            );
-        } catch (err) {
-            console.error("❌ Les commentaires ne se sont pas chargés, impossible de répondre.");
-            await browser.close();
-            process.exit(1);
-        }
-
-        // Récupérer la liste des commentaires
-        const commentItems = await page.$$('div[class*="DivCommentObject"], [data-e2e="comment-item"], li[class*="CommentItem"]');
-        if (commentItems.length === 0) {
-            console.error("❌ Aucun commentaire présent sur la vidéo. Action annulée.");
-            await browser.close();
-            process.exit(1);
-        }
-        if (commentIndex >= commentItems.length) {
-            console.error(`❌ Index de commentaire invalide (${commentIndex}). Seulement ${commentItems.length} commentaire(s) disponible(s).`);
-            await browser.close();
-            process.exit(1);
-        }
-
-        // Cibler le commentaire voulu
-        const targetComment = commentItems[commentIndex];
-        // Scroll jusqu'au commentaire cible (au cas où il n'est pas dans la vue)
-        await targetComment.scrollIntoViewIfNeeded().catch(() => {});  // Ignorer les erreurs éventuelles de scroll
-
-        // Trouver le bouton "Répondre" dans ce commentaire
-        const replyButton = await targetComment.$('button:has-text("Répondre"), button:has-text("Reply"), [data-e2e="comment-reply"]');
-        if (!replyButton) {
-            console.error("❌ Bouton 'Répondre' introuvable pour le commentaire sélectionné.");
-            await browser.close();
-            process.exit(1);
-        }
-
-        console.log("✔️ Bouton 'Répondre' trouvé. Clic en cours...");
-        try {
-            await replyButton.click({ timeout: 5000 });
-        } catch (err) {
-            console.error("❌ Impossible de cliquer sur 'Répondre' (peut-être invisible ou désactivé).");
-            await browser.close();
-            process.exit(1);
-        }
-
-        // Attendre que le champ de saisie de réponse apparaisse
-        let inputField;
-        try {
-            inputField = await page.waitForSelector('[data-e2e="comment-input"], textarea', { timeout: 5000, state: 'visible' });
-        } catch (err) {
-            console.error("❌ Champ de saisie pour la réponse non visible après clic.");
-            await browser.close();
-            process.exit(1);
-        }
-
-        console.log("✔️ Champ de saisie trouvé. Envoi du texte de réponse...");
-        try {
-            // Saisie du texte dans le champ
-            await inputField.fill(replyText, { timeout: 5000 });
-        } catch (err) {
-            console.error("❌ Impossible d'écrire le texte dans le champ de réponse.");
-            await browser.close();
-            process.exit(1);
-        }
-
-        // Envoi (publication) de la réponse
-        // Option 1: presser la touche Entrée pour valider l'envoi
-        try {
-            await inputField.press('Enter');
-        } catch (err) {
-            console.warn("⚠️ Échec de la validation par Entrée, tentative de clic sur le bouton d'envoi...");
-            // Option 2: si Enter ne fonctionne pas, chercher un bouton Envoyer/Send
-            const sendBtn = await page.$('button:has-text("Envoyer"), button:has-text("Send")');
-            if (sendBtn) {
-                try {
-                    await sendBtn.click();
-                } catch (err2) {
-                    console.error("❌ Impossible de cliquer sur le bouton d'envoi de la réponse.", err2);
-                    await browser.close();
-                    process.exit(1);
-                }
-            } else {
-                console.error("❌ Bouton d'envoi introuvable, la réponse n'a pas pu être envoyée.");
-                await browser.close();
-                process.exit(1);
-            }
-        }
-
-        console.log(`✔️ Réponse envoyée au commentaire #${commentIndex} : "${replyText}"`);
-        console.log("🎉 Action de réponse terminée avec succès.");
-    } 
-
-    else {
-        console.error("❌ Mode inconnu :", mode);
-    }
-
-    // Fermeture du navigateur
     await browser.close();
-})();
+    return res.json({ ok: true, count: comments.length, comments, url: videoUrl });
+  } catch (e) {
+    return res.json({ ok: false, error: e.message || String(e) });
+  }
+}
+
+// --- reply
+async function tiktokReply(req, res) {
+  const {
+    videoUrl,
+    replyText,
+    commentIndex = 0,
+    account = TTK_ACCOUNT,
+    platform = TTK_PLATFORM,
+  } = req.body;
+
+  if (!videoUrl || !replyText) {
+    return res.json({ ok: false, error: 'Missing "videoUrl" or "replyText"' });
+  }
+
+  try {
+    const { browser, page } = await getContextWithSession({ account, platform });
+    await page.goto(videoUrl, { waitUntil: 'domcontentloaded', timeout: 60000 });
+    await ensureCommentsOpen(page);
+    await hydrateComments(page, 12);
+
+    // Bouton "Répondre"
+    const item = page.locator(SEL.item).nth(commentIndex);
+    await item.scrollIntoViewIfNeeded().catch(() => {});
+    const btn = item.locator(SEL.replyBtn).first();
+    await btn.click({ timeout: 10000 });
+
+    // Saisie
+    await closeBlockingOverlays(page);
+    const input = page.locator(SEL.input).first();
+    await input.click({ timeout: 8000 });
+    await input.fill(replyText);
+    await page.keyboard.press('Enter');
+
+    await page.waitForTimeout(1500);
+    await browser.close();
+    return res.json({ ok: true, videoUrl, commentIndex, replyText });
+  } catch (e) {
+    return res.json({ ok: false, error: e.message || String(e) });
+  }
+}
+// ============================================================
+
+// ---------- START ----------
+app.listen(PORT, () => {
+  console.log(`Server listening on http://localhost:${PORT}`);
+});
 
