@@ -27,7 +27,7 @@ app.use(express.json({ limit: '5mb' }));
 app.get('/health', (_req, res) => res.status(200).send('ok'));
 
 // ---------- UTILS COOKIES ----------
-const TTK_BASE_URL = 'https://www.tiktok.com/'; // slash final important
+const TTK_BASE_URL = 'https://www.tiktok.com/'; // slash final
 
 const mapSameSite = (v) => {
   if (v === undefined || v === null) return undefined;
@@ -38,29 +38,28 @@ const mapSameSite = (v) => {
   return undefined;
 };
 
-const toPlaywrightCookiesStrict = (raw = []) => {
-  return raw
+// Cookie-Editor -> Playwright Cookies (basés sur url)
+const toPlaywrightCookiesStrict = (raw = []) =>
+  raw
     .filter((c) => c && typeof c.name === 'string' && c.name.length > 0 && c.value !== undefined)
     .map((c) => {
       const out = {
         name: String(c.name),
         value: String(c.value ?? ''),
-        url: TTK_BASE_URL,        // éviter l'erreur "Cookie should have either url or path"
+        url: TTK_BASE_URL, // évite les soucis domain/path
         httpOnly: !!c.httpOnly,
         secure: !!c.secure,
       };
       const ss = mapSameSite(c.sameSite);
       if (ss) out.sameSite = ss;
       if (ss === 'None') out.secure = true; // règle web
-
       let exp = Number(c.expirationDate ?? c.expiry);
       if (Number.isFinite(exp) && exp > 0) {
-        if (exp > 1e12) exp = Math.floor(exp / 1000);
+        if (exp > 1e12) exp = Math.floor(exp / 1000); // ms -> s si nécessaire
         out.expires = Math.floor(exp);
       }
       return out;
     });
-};
 
 const cookieFlags = (list = []) => {
   const names = new Set(list.map((c) => c.name));
@@ -78,19 +77,16 @@ const cookieFlags = (list = []) => {
   };
 };
 
-// ---------- SUPABASE HELPERS ----------
+// ---------- SUPABASE ----------
 async function upsertSession({ platform, account, cookies, user_agent }) {
   if (!supabase) throw new Error('Supabase not configured');
   if (!Array.isArray(cookies)) throw new Error('cookies must be an array');
-
   const row = { platform, account, cookies, user_agent: user_agent || null };
-
   const { data, error } = await supabase
     .from('tiktok_sessions')
     .upsert(row, { onConflict: 'platform,account' })
     .select()
     .limit(1);
-
   if (error) throw error;
   return data && data[0];
 }
@@ -104,47 +100,150 @@ async function loadSession(platform, account) {
     .eq('account', account)
     .order('id', { ascending: false })
     .limit(1);
-
   if (error) throw error;
-  if (!data || !data.length) return null;
-  return data[0];
+  return data?.[0] || null;
 }
 
-// ---------- AUTH: ENREGISTRE LES COOKIES EN DB ----------
+// ---------- AUTH: ENREGISTRE LES COOKIES ----------
 app.post('/auth/set-cookies', async (req, res) => {
   try {
     const platform = (req.body.platform || TTK_PLATFORM || 'tiktok').toLowerCase();
     const account = req.body.account || TTK_ACCOUNT;
     const cookies = req.body.cookies;
-
-    if (!Array.isArray(cookies)) {
-      return res.status(400).json({ ok: false, error: 'Body must include "cookies": []' });
-    }
-    if (!account) {
-      return res.status(400).json({ ok: false, error: 'Missing "account"' });
-    }
+    if (!Array.isArray(cookies)) return res.status(400).json({ ok: false, error: 'Body must include "cookies": []' });
+    if (!account) return res.status(400).json({ ok: false, error: 'Missing "account"' });
 
     const saved = await upsertSession({
-      platform,
-      account,
-      cookies,
+      platform, account, cookies,
       user_agent: req.body.user_agent || req.headers['user-agent'] || null,
     });
 
-    return res.json({
-      ok: true,
-      platform,
-      account,
-      saved: cookies.length,
-      flags: cookieFlags(cookies),
-      rowId: saved?.id || null,
-    });
+    res.json({ ok: true, platform, account, saved: cookies.length, flags: cookieFlags(cookies), rowId: saved?.id || null });
   } catch (e) {
-    return res.status(500).json({ ok: false, error: e.message || String(e) });
+    res.status(500).json({ ok: false, error: e.message || String(e) });
   }
 });
 
-// ===================== HELPERS PAGE/CONTEXT =====================
+// ===================== HELPERS TIKTOK =====================
+
+// ferme les overlays TUX si présents
+async function closeOverlays(page) {
+  for (let i = 0; i < 3; i++) {
+    const hasOverlay = await page.locator('div[class*="TUXModal-overlay"], div[data-tux-overlay], [data-floating-portal="true"]').first().isVisible().catch(() => false);
+    if (!hasOverlay) break;
+    await page.keyboard.press('Escape').catch(() => {});
+    await page.waitForTimeout(300);
+  }
+}
+
+// ouvre l’onglet “Commentaires” (FR/EN) et scrolle dans le bon conteneur
+async function openCommentsPanel(page) {
+  // s’assure qu’on est bien sur la page vidéo
+  await page.waitForLoadState('domcontentloaded', { timeout: 30000 });
+
+  // activer l’onglet commentaires
+  const commentTabCandidates = [
+    'button:has-text("Commentaires")',
+    'div[role="tab"]:has-text("Commentaires")',
+    'button:has-text("Comments")',
+    'div[role="tab"]:has-text("Comments")',
+  ];
+  for (const sel of commentTabCandidates) {
+    const el = page.locator(sel).first();
+    if (await el.count() && (await el.isVisible().catch(() => false))) {
+      await el.click({ timeout: 5000 }).catch(() => {});
+      break;
+    }
+  }
+
+  // conteneurs possibles des items de commentaires
+  const panelCandidates = [
+    'div[class*="DivCommentContainer"]',
+    'div[class*="DivCommentList"]',
+    'div[data-e2e="comment-list"]',
+    'div[class*="DivRightContainer"] div:has([data-e2e*="comment"])',
+  ];
+
+  let panel = null;
+  for (const sel of panelCandidates) {
+    const loc = page.locator(sel).first();
+    if (await loc.count()) { panel = loc; break; }
+  }
+  if (!panel) panel = page.locator('body');
+
+  // charger du contenu via scroll
+  for (let i = 0; i < 6; i++) {
+    await panel.evaluate((el) => { el.scrollBy?.(0, 1200); }, {}).catch(() => {});
+    await page.waitForTimeout(350);
+  }
+  await closeOverlays(page);
+}
+
+// essaie plusieurs variantes de sélecteurs et retourne celles qui “matchent”
+async function discoverSelectors(page) {
+  const candidates = {
+    item: [
+      '[data-e2e="comment-item"]',
+      '[data-e2e^="comment-item"]',
+      'li[class*="CommentItem"]',
+      'div[class*="DivCommentObject"]',
+    ],
+    user: [
+      '[data-e2e="comment-username"]',
+      '[data-e2e^="comment-username"]',
+      '[data-e2e="comment-user-name"]',
+      '[data-e2e^="comment-user"]',
+      'a[href^="/@"]',
+    ],
+    text: [
+      '[data-e2e="comment-content"]',
+      '[data-e2e^="comment-text"]',
+      '[data-e2e^="comment-level"]', // ex: comment-level-1
+      'span[class*="CommentSubContent"]',
+      'p[class*="StyledTUXText"] + span', // fallback
+    ],
+    reply: [
+      '[data-e2e="comment-reply"]',
+      'button:has-text("Répondre")',
+      'button:has-text("Reply")',
+      'a:has-text("Répondre")',
+      'a:has-text("Reply")',
+    ],
+  };
+
+  const pickFirstWorking = async (list) => {
+    for (const sel of list) {
+      const n = await page.locator(sel).count().catch(() => 0);
+      if (n > 0) return sel;
+    }
+    return null;
+  };
+
+  const item = await pickFirstWorking(candidates.item);
+  const user = await pickFirstWorking(candidates.user);
+  const text = await pickFirstWorking(candidates.text);
+  const reply = await pickFirstWorking(candidates.reply);
+
+  return { item, user, text, reply };
+}
+
+// fabrique un échantillon lisible
+async function sampleComments(page, sels, max = 5) {
+  if (!sels.item) return [];
+  const items = page.locator(sels.item);
+  const total = await items.count().catch(() => 0);
+  const take = Math.min(max, total);
+  const out = [];
+  for (let i = 0; i < take; i++) {
+    const root = items.nth(i);
+    const user = sels.user ? await root.locator(sels.user).first().innerText().catch(() => null) : null;
+    const text = sels.text ? await root.locator(sels.text).first().innerText().catch(() => null) : null;
+    out.push({ index: i, user, text });
+  }
+  return out;
+}
+
+// lance un contexte avec session (cookies Supabase)
 async function getContextWithSession({ account = TTK_ACCOUNT, platform = TTK_PLATFORM }) {
   if (!hasSupabase) throw new Error('Supabase not configured');
   const session = await loadSession(platform, account);
@@ -156,7 +255,7 @@ async function getContextWithSession({ account = TTK_ACCOUNT, platform = TTK_PLA
   const browser = await chromium.launch({ headless: HEADLESS });
   const context = await browser.newContext({
     userAgent: session.user_agent || undefined,
-    viewport: { width: 1280, height: 800 },
+    viewport: { width: 1280, height: 900 },
   });
 
   for (let i = 0; i < cookiesPW.length; i++) {
@@ -169,65 +268,35 @@ async function getContextWithSession({ account = TTK_ACCOUNT, platform = TTK_PLA
   const page = await context.newPage();
   return { browser, context, page };
 }
-
-async function dismissOverlays(page) {
-  // ferme modales TUX / overlays si présents
-  for (let i = 0; i < 3; i++) {
-    await page.keyboard.press('Escape').catch(() => {});
-    await page.mouse.click(10, 10).catch(() => {});
-    await page.waitForTimeout(150);
-  }
-}
-
-// Sélecteurs (robustes / multilingues)
-const SEL = {
-  COMMENT_ITEM: '[data-e2e="comment-item"], li[class*="CommentItem"]',
-  COMMENT_USER: '[data-e2e="comment-username"], [data-e2e="comment-user-name"], a[href^="/@"]',
-  COMMENT_TEXT: 'span[data-e2e="comment-level-1"], [data-e2e="comment-text"]',
-  REPLY_BTN_IN: 'button:has-text("Répondre"), button:has-text("Reply")',
-  COMMENT_INPUT: '[data-e2e="comment-input"], textarea',
-};
-
-async function ensureCommentsReady(page) {
-  await page.locator(SEL.COMMENT_USER).first().waitFor({ timeout: 15000 });
-  // petit scroll pour stabiliser la zone des commentaires
-  await page.mouse.wheel(0, 1200).catch(() => {});
-  await page.waitForTimeout(500);
-}
-// ===============================================================
+// ===========================================================
 
 // ---------- RUN MODES ----------
 app.post('/run', async (req, res) => {
   const mode = req.body.mode || 'smoke';
-
-  if (mode === 'smoke')                return smokeRun(req, res);
-  if (mode === 'tiktok.check')         return tiktokCheck(req, res);
-  if (mode === 'tiktok.debugSelectors')return tiktokDebugSelectors(req, res);
-  if (mode === 'tiktok.fetchComments') return tiktokFetchComments(req, res);
-  if (mode === 'tiktok.reply')         return tiktokReply(req, res);
-
-  return res.json({ ok: true, mode }); // fallback debug
+  if (mode === 'smoke')                 return smokeRun(req, res);
+  if (mode === 'tiktok.check')          return tiktokCheck(req, res);
+  if (mode === 'tiktok.debugSelectors') return tiktokDebugSelectors(req, res);
+  if (mode === 'tiktok.fetchComments')  return tiktokFetchComments(req, res);
+  if (mode === 'tiktok.reply')          return tiktokReply(req, res);
+  return res.json({ ok: true, mode });
 });
 
-// --- mode: smoke (test basique navigateur)
+// --- smoke
 async function smokeRun(_req, res) {
   const browser = await chromium.launch({ headless: HEADLESS });
   const context = await browser.newContext({ viewport: { width: 1280, height: 800 } });
   const page = await context.newPage();
-
   await page.goto(SMOKE_URL, { waitUntil: 'domcontentloaded', timeout: 60000 });
   const title = await page.title();
   const url = page.url();
-
   await browser.close();
-  return res.json({ ok: true, title, url });
+  res.json({ ok: true, title, url });
 }
 
-// --- mode: tiktok.check (utilise les cookies depuis Supabase)
+// --- tiktok.check
 async function tiktokCheck(req, res) {
   const account = req.body.account || TTK_ACCOUNT;
   const platform = (req.body.platform || TTK_PLATFORM || 'tiktok').toLowerCase();
-
   if (!hasSupabase) return res.json({ ok: false, error: 'Supabase not configured' });
   if (!account) return res.json({ ok: false, error: 'Missing "account"' });
 
@@ -235,21 +304,16 @@ async function tiktokCheck(req, res) {
     const session = await loadSession(platform, account);
     if (!session) return res.json({ ok: false, error: 'No session in DB for this account/platform' });
 
-    const cookiesRaw = Array.isArray(session.cookies) ? session.cookies : [];
-    const cookiesPW = toPlaywrightCookiesStrict(cookiesRaw);
-
+    const cookiesPW = toPlaywrightCookiesStrict(session.cookies || []);
     const browser = await chromium.launch({ headless: HEADLESS });
     const context = await browser.newContext({
       userAgent: session.user_agent || undefined,
-      viewport: { width: 1280, height: 800 },
+      viewport: { width: 1280, height: 900 },
     });
 
     try {
       for (let i = 0; i < cookiesPW.length; i++) {
-        const ck = cookiesPW[i];
-        await context.addCookies([ck]).catch((e) => {
-          throw new Error(`cookie[${i}] "${ck.name}": ${e.message}`);
-        });
+        await context.addCookies([cookiesPW[i]]);
       }
     } catch (e) {
       await browser.close();
@@ -259,44 +323,25 @@ async function tiktokCheck(req, res) {
     const page = await context.newPage();
     await page.goto(TTK_BASE_URL, { waitUntil: 'domcontentloaded', timeout: 60000 });
 
-    // Détection simple de connexion
     let loggedIn = false;
     try {
       const avatar = await page.locator('[data-e2e="nav-user-avatar"]').first().isVisible().catch(() => false);
-      const loginBtn = await page
-        .locator('[data-e2e="top-login-button"], a[href*="/login"]')
-        .first()
-        .isVisible()
-        .catch(() => false);
-
-      const names = new Set(cookiesRaw.map((c) => c.name));
+      const loginBtn = await page.locator('[data-e2e="top-login-button"], a[href*="/login"]').first().isVisible().catch(() => false);
+      const names = new Set((session.cookies || []).map((c) => c.name));
       const hasSess = names.has('sessionid') || names.has('sessionid_ss') || names.has('sid_tt');
-
       loggedIn = Boolean(avatar || (hasSess && !loginBtn));
     } catch (_) {}
 
     const title = await page.title().catch(() => null);
     const url = page.url();
-
     await browser.close();
-    return res.json({
-      ok: true,
-      usedSupabase: true,
-      account,
-      platform,
-      loggedIn,
-      title,
-      url,
-      cookiesCount: cookiesPW.length,
-    });
+    res.json({ ok: true, usedSupabase: true, account, platform, loggedIn, title, url, cookiesCount: cookiesPW.length });
   } catch (e) {
-    return res.json({ ok: false, error: e.message || String(e) });
+    res.json({ ok: false, error: e.message || String(e) });
   }
 }
 
-// ===================== HANDLERS =====================
-
-// Debug sélecteurs commentaires
+// --- DEBUG SELECTORS (renvoie ce qui “matche” vraiment)
 async function tiktokDebugSelectors(req, res) {
   const { videoUrl, account = TTK_ACCOUNT, platform = TTK_PLATFORM } = req.body;
   if (!videoUrl) return res.json({ ok: false, error: 'Missing "videoUrl"' });
@@ -304,39 +349,25 @@ async function tiktokDebugSelectors(req, res) {
   try {
     const { browser, page } = await getContextWithSession({ account, platform });
     await page.goto(videoUrl, { waitUntil: 'domcontentloaded', timeout: 60000 });
-    await dismissOverlays(page);
-    await ensureCommentsReady(page);
+    await openCommentsPanel(page);
 
-    const counts = await page.evaluate((SEL) => {
-      const count = (s) => document.querySelectorAll(s).length;
-      return {
-        commentItem: count(SEL.COMMENT_ITEM),
-        commentUser: count(SEL.COMMENT_USER),
-        commentText: count(SEL.COMMENT_TEXT),
-        replyButtons: document.querySelectorAll(SEL.REPLY_BTN_IN).length,
-      };
-    }, SEL);
+    const sels = await discoverSelectors(page);
+    const sample = await sampleComments(page, sels, 5);
 
-    const sample = await page.evaluate((SEL) => {
-      const items = Array.from(document.querySelectorAll(SEL.COMMENT_ITEM)).slice(0, 5);
-      return items.map((el, i) => {
-        const u = el.querySelector(SEL.COMMENT_USER)?.textContent?.trim() || null;
-        const t =
-          el.querySelector(SEL.COMMENT_TEXT)?.textContent?.trim() ||
-          el.querySelector('[data-e2e*="comment"]')?.textContent?.trim() ||
-          null;
-        return { index: i, user: u, text: t };
-      });
-    }, SEL);
+    // comptages
+    const counts = {};
+    for (const [k, v] of Object.entries(sels)) {
+      counts[k] = v ? await page.locator(v).count().catch(() => 0) : 0;
+    }
 
     await browser.close();
-    return res.json({ ok: true, url: videoUrl, counts, sample });
+    return res.json({ ok: true, url: videoUrl, selectors: sels, counts, sample });
   } catch (e) {
     return res.json({ ok: false, error: e.message || String(e) });
   }
 }
 
-// Récupère N commentaires
+// --- FETCH COMMENTS
 async function tiktokFetchComments(req, res) {
   const { videoUrl, limit = 5, account = TTK_ACCOUNT, platform = TTK_PLATFORM } = req.body;
   if (!videoUrl) return res.json({ ok: false, error: 'Missing "videoUrl"' });
@@ -344,23 +375,33 @@ async function tiktokFetchComments(req, res) {
   try {
     const { browser, page } = await getContextWithSession({ account, platform });
     await page.goto(videoUrl, { waitUntil: 'domcontentloaded', timeout: 60000 });
-    await dismissOverlays(page);
-    await ensureCommentsReady(page);
+    await openCommentsPanel(page);
 
-    const comments = await page.evaluate(({ SEL, limit }) => {
-      const items = Array.from(document.querySelectorAll(SEL.COMMENT_ITEM));
-      return items.slice(0, Number(limit)).map((el, idx) => {
-        const user =
-          el.querySelector(SEL.COMMENT_USER)?.textContent?.trim() ||
-          el.querySelector('a[href^="/@"]')?.textContent?.trim() ||
-          null;
-        const text =
-          el.querySelector(SEL.COMMENT_TEXT)?.textContent?.trim() ||
-          el.querySelector('[data-e2e*="comment"]')?.textContent?.trim() ||
-          null;
-        return { index: idx, user, text };
-      });
-    }, { SEL, limit });
+    const sels = await discoverSelectors(page);
+
+    if (!sels.item) {
+      await browser.close();
+      return res.json({ ok: true, count: 0, comments: [], url: videoUrl });
+    }
+
+    // scroll supplémentaire pour forcer la virtualisation à hydrater
+    const panel = page.locator('div[class*="DivCommentContainer"], div[data-e2e="comment-list"]').first();
+    for (let i = 0; i < 8; i++) {
+      await panel.evaluate((el) => { el.scrollBy?.(0, 1400); }, {}).catch(() => {});
+      await page.waitForTimeout(250);
+    }
+
+    const items = page.locator(sels.item);
+    const total = await items.count().catch(() => 0);
+    const take = Math.min(limit, total);
+
+    const comments = [];
+    for (let i = 0; i < take; i++) {
+      const root = items.nth(i);
+      const user = sels.user ? await root.locator(sels.user).first().innerText().catch(() => null) : null;
+      const text = sels.text ? await root.locator(sels.text).first().innerText().catch(() => null) : null;
+      if (user || text) comments.push({ index: i, user, text });
+    }
 
     await browser.close();
     return res.json({ ok: true, count: comments.length, comments, url: videoUrl });
@@ -369,56 +410,74 @@ async function tiktokFetchComments(req, res) {
   }
 }
 
-// Répond au commentaire n° commentIndex
+// --- REPLY
 async function tiktokReply(req, res) {
   const {
-    videoUrl,
-    replyText,
+    videoUrl, replyText,
     commentIndex = 0,
-    account = TTK_ACCOUNT,
-    platform = TTK_PLATFORM,
+    account = TTK_ACCOUNT, platform = TTK_PLATFORM,
   } = req.body;
 
-  if (!videoUrl || !replyText) {
-    return res.json({ ok: false, error: 'Missing "videoUrl" or "replyText"' });
-  }
+  if (!videoUrl || !replyText) return res.json({ ok: false, error: 'Missing "videoUrl" or "replyText"' });
 
   try {
     const { browser, page } = await getContextWithSession({ account, platform });
     await page.goto(videoUrl, { waitUntil: 'domcontentloaded', timeout: 60000 });
-    await dismissOverlays(page);
-    await ensureCommentsReady(page);
+    await openCommentsPanel(page);
 
-    const item = page.locator(SEL.COMMENT_ITEM).nth(Number(commentIndex));
-    await item.scrollIntoViewIfNeeded();
-    const handle = (await item.locator(SEL.COMMENT_USER).first().textContent().catch(() => null))?.trim() || null;
-
-    // 1) On tente le vrai bouton "Répondre"/"Reply"
-    const replyBtn = item.getByRole('button', { name: /r[ée]pondre|reply/i });
-    const hasBtn = await replyBtn.first().isVisible().catch(() => false);
-
-    if (hasBtn) {
-      await replyBtn.first().click({ timeout: 10000 });
-      await dismissOverlays(page);
+    const sels = await discoverSelectors(page);
+    if (!sels.item) {
+      await browser.close();
+      return res.json({ ok: false, error: `No comment items found`, url: videoUrl });
     }
 
-    // 2) Cibler la zone de saisie et envoyer
-    const input = page.locator(SEL.COMMENT_INPUT).first();
-    await input.click({ timeout: 8000 }); // Overlay ? on retente après dismissal
-    await dismissOverlays(page);
-    await input.click({ timeout: 8000 });
-    const mention = handle ? `@${handle.replace(/^@/, '')} ` : '';
-    await input.fill(`${mention}${replyText}`);
-    await page.keyboard.press('Enter');
+    // s’assurer que l’item visé est rendu (scroll ciblé)
+    const items = page.locator(sels.item);
+    const total = await items.count().catch(() => 0);
+    if (commentIndex < 0 || commentIndex >= total) {
+      await browser.close();
+      return res.json({ ok: false, error: `commentIndex ${commentIndex} not found`, url: videoUrl });
+    }
 
+    const target = items.nth(commentIndex);
+    await target.scrollIntoViewIfNeeded().catch(() => {});
+    await page.waitForTimeout(300);
+
+    // cliquer sur "Répondre"/"Reply" relatif à l’item (fallback: focus le champ global)
+    let clicked = false;
+    if (sels.reply) {
+      const btn = target.locator(sels.reply).first();
+      if (await btn.count()) {
+        await closeOverlays(page);
+        await btn.click({ timeout: 4000 }).then(() => { clicked = true; }).catch(() => {});
+      }
+    }
+
+    // champ d’input de réponse (local ou global)
+    const input = page.locator('[data-e2e="comment-input"], textarea').first();
+
+    // si pas cliqué, on tente de focus l’input global directement
+    if (!clicked) {
+      await closeOverlays(page);
+      await input.click({ timeout: 4000 }).catch(() => {});
+    }
+
+    await input.fill(replyText, { timeout: 4000 }).catch(async () => {
+      // dernier recours: type direct
+      await input.focus().catch(() => {});
+      await page.keyboard.type(replyText, { delay: 20 }).catch(() => {});
+    });
+
+    await closeOverlays(page);
+    await page.keyboard.press('Enter').catch(() => {});
     await page.waitForTimeout(2000);
+
     await browser.close();
-    return res.json({ ok: true, videoUrl, commentIndex: Number(commentIndex), replyText, mentioned: handle || null });
+    return res.json({ ok: true, videoUrl, commentIndex, replyText });
   } catch (e) {
     return res.json({ ok: false, error: e.message || String(e) });
   }
 }
-// ============================================================
 
 // ---------- START ----------
 app.listen(PORT, () => {
