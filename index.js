@@ -28,7 +28,7 @@ app.use(express.json({ limit: '5mb' }));
 app.get('/health', (_req, res) => res.status(200).send('ok'));
 
 // ---------- UTILS COOKIES ----------
-const TTK_BASE_URL = 'https://www.tiktok.com/'; // ← slash final
+const TTK_BASE_URL = 'https://www.tiktok.com/'; // slash final
 
 const mapSameSite = (v) => {
   if (v === undefined || v === null) return undefined;
@@ -55,14 +55,12 @@ const toPlaywrightCookiesStrict = (raw = []) => {
       // SameSite
       const ss = mapSameSite(c.sameSite);
       if (ss) out.sameSite = ss;
-
-      // règle web: SameSite=None ⇒ Secure obligatoire
-      if (ss === 'None') out.secure = true;
+      if (ss === 'None') out.secure = true; // règle web: None ⇒ Secure obligatoire
 
       // Expiration (Cookie-Editor => 'expirationDate' en secondes)
       let exp = Number(c.expirationDate ?? c.expiry);
       if (Number.isFinite(exp) && exp > 0) {
-        if (exp > 1e12) exp = Math.floor(exp / 1000); // on corrige si ms
+        if (exp > 1e12) exp = Math.floor(exp / 1000); // corrige si ms
         out.expires = Math.floor(exp);
       }
       return out;
@@ -153,6 +151,44 @@ app.post('/auth/set-cookies', async (req, res) => {
 });
 
 // ===================== HELPERS (AJOUT) =====================
+const COMMENT_ITEM_SEL =
+  '[data-e2e="comment-item"], div[data-e2e^="comment-item"], li[class*="CommentItem"]';
+
+const REPLY_BUTTON_SEL =
+  '[data-e2e="comment-reply"], button:has-text("Reply"), button:has-text("Répondre")';
+
+// Ouvre le panneau de commentaires si la liste n’est pas visible
+async function openCommentsPanel(page) {
+  const hasItems = await page.locator(COMMENT_ITEM_SEL).first().isVisible().catch(() => false);
+  if (hasItems) return;
+
+  const toggles = [
+    '[data-e2e="comment-icon"]',
+    '[data-e2e="browse-comment-icon"]',
+    'button[aria-label*="comment"]',
+    'button:has-text("Commentaires")',
+    'button:has-text("Comments")',
+  ];
+  for (const sel of toggles) {
+    const loc = page.locator(sel).first();
+    if (await loc.count()) {
+      await loc.click({ timeout: 5000 }).catch(() => {});
+      break;
+    }
+  }
+  await page.waitForTimeout(800);
+}
+
+// Scroll/“nudge” pour forcer le rendu/virtualisation des items
+async function nudgeForComments(page) {
+  for (let i = 0; i < 5; i++) {
+    if (await page.locator(COMMENT_ITEM_SEL).count()) break;
+    await page.mouse.wheel(0, 1200).catch(() => {});
+    await page.waitForTimeout(600);
+  }
+}
+
+// Construit un contexte Playwright avec la session DB déjà injectée
 async function getContextWithSession({ account = TTK_ACCOUNT, platform = TTK_PLATFORM }) {
   if (!hasSupabase) throw new Error('Supabase not configured');
   const session = await loadSession(platform, account);
@@ -183,10 +219,10 @@ async function getContextWithSession({ account = TTK_ACCOUNT, platform = TTK_PLA
 app.post('/run', async (req, res) => {
   const mode = req.body.mode || 'smoke';
 
-  if (mode === 'smoke')              return smokeRun(req, res);
-  if (mode === 'tiktok.check')       return tiktokCheck(req, res);
-  if (mode === 'tiktok.fetchComments') return tiktokFetchComments(req, res); // ← AJOUT
-  if (mode === 'tiktok.reply')         return tiktokReply(req, res);         // ← AJOUT
+  if (mode === 'smoke')                return smokeRun(req, res);
+  if (mode === 'tiktok.check')         return tiktokCheck(req, res);
+  if (mode === 'tiktok.fetchComments') return tiktokFetchComments(req, res);
+  if (mode === 'tiktok.reply')         return tiktokReply(req, res);
 
   return res.json({ ok: true, mode }); // fallback debug
 });
@@ -290,18 +326,19 @@ async function tiktokFetchComments(req, res) {
   const { videoUrl, limit = 5, account = TTK_ACCOUNT, platform = TTK_PLATFORM } = req.body;
   if (!videoUrl) return res.json({ ok: false, error: 'Missing "videoUrl"' });
 
+  let browser;
   try {
-    const { browser, page } = await getContextWithSession({ account, platform });
+    const ctx = await getContextWithSession({ account, platform });
+    browser = ctx.browser;
+    const page = ctx.page;
 
     await page.goto(videoUrl, { waitUntil: 'domcontentloaded', timeout: 60000 });
-    await page.waitForTimeout(1500);
 
-    // se place sur la zone de commentaires
-    await page.mouse.wheel(0, 1200).catch(() => {});
-    await page.waitForTimeout(800);
+    await openCommentsPanel(page);
+    await nudgeForComments(page);
 
-    const comments = await page.evaluate((max) => {
-      const items = Array.from(document.querySelectorAll('[data-e2e="comment-item"]'));
+    const comments = await page.evaluate((max, itemSel) => {
+      const items = Array.from(document.querySelectorAll(itemSel));
       return items.slice(0, max).map((el, idx) => {
         const user =
           el.querySelector('[data-e2e="comment-username"]')?.textContent?.trim() ||
@@ -314,16 +351,17 @@ async function tiktokFetchComments(req, res) {
         const time = el.querySelector('time')?.getAttribute('datetime') || null;
         return { index: idx, user, text, time };
       });
-    }, limit);
+    }, limit, COMMENT_ITEM_SEL);
 
     await browser.close();
     return res.json({ ok: true, count: comments.length, comments, url: videoUrl });
   } catch (e) {
+    if (browser) await browser.close().catch(() => {});
     return res.json({ ok: false, error: e.message || String(e) });
   }
 }
 
-// Répond au commentaire n° commentIndex
+// Répond au commentaire n° commentIndex (robuste)
 async function tiktokReply(req, res) {
   const {
     videoUrl,
@@ -337,31 +375,51 @@ async function tiktokReply(req, res) {
     return res.json({ ok: false, error: 'Missing "videoUrl" or "replyText"' });
   }
 
+  let browser;
   try {
-    const { browser, page } = await getContextWithSession({ account, platform });
+    const ctx = await getContextWithSession({ account, platform });
+    browser = ctx.browser;
+    const page = ctx.page;
 
     await page.goto(videoUrl, { waitUntil: 'domcontentloaded', timeout: 60000 });
-    await page.waitForTimeout(1500);
 
-    await page.mouse.wheel(0, 1200).catch(() => {});
-    await page.waitForTimeout(800);
+    // Assure l’ouverture et le rendu de la liste
+    await openCommentsPanel(page);
+    await nudgeForComments(page);
 
-    const replyBtn = page.locator(
-      `[data-e2e="comment-item"]:nth-of-type(${commentIndex + 1}) [data-e2e="comment-reply"], ` +
-      `[data-e2e="comment-item"]:nth-of-type(${commentIndex + 1}) button:has-text("Répondre"), ` +
-      `[data-e2e="comment-item"]:nth-of-type(${commentIndex + 1}) button:has-text("Reply")`
-    );
+    const list = page.locator(COMMENT_ITEM_SEL);
+    await list.first().waitFor({ timeout: 10000 });
 
-    await replyBtn.first().click({ timeout: 10000 });
+    const item = list.nth(commentIndex);
+    await item.scrollIntoViewIfNeeded().catch(() => {});
+    await item.hover().catch(() => {});
+    await page.waitForTimeout(300);
 
-    const input = page.locator('[data-e2e="comment-input"], textarea');
+    const replyBtn = item.locator(REPLY_BUTTON_SEL).first();
+    await replyBtn.click({ timeout: 10000 });
+
+    const input = page.locator('[data-e2e="comment-input"], textarea').first();
+    await input.waitFor({ timeout: 8000 });
     await input.fill(replyText);
+
+    // Tentative 1: Enter
     await page.keyboard.press('Enter');
+
+    // Fallback: bouton “Envoyer/Send/Post”
+    await page
+      .locator(
+        'button:has-text("Envoyer"), button:has-text("Send"), [data-e2e="comment-post"], [data-e2e="post-comment"]'
+      )
+      .first()
+      .click({ timeout: 3000 })
+      .catch(() => {});
+
     await page.waitForTimeout(2000);
 
     await browser.close();
     return res.json({ ok: true, videoUrl, commentIndex, replyText });
   } catch (e) {
+    if (browser) await browser.close().catch(() => {});
     return res.json({ ok: false, error: e.message || String(e) });
   }
 }
